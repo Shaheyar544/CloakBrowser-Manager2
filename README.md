@@ -85,6 +85,13 @@ profile. Camoufox is Firefox-based, so Chromium CDP automation and unpacked
 Chrome extensions are unavailable in this mode. Switching engines does not
 convert or delete the other engine's browser state.
 
+For proxy profiles, the Manager disables Firefox DNS-over-HTTPS, prefetch, and
+speculative DNS. It also requests remote DNS resolution when a SOCKS5 endpoint
+is usable by the browser engine. Authenticated SOCKS5 is not supported by every
+Playwright browser; use the provider's HTTP endpoint in that case. The DNS
+resolver IP may still differ from the exit IP when the proxy provider operates
+separate DNS infrastructure.
+
 Open [http://localhost:8080](http://localhost:8080), create a profile, and click Launch.
 
 > **Early alpha** — this project is under active development. Expect bugs. If you find one, please [open an issue](https://github.com/CloakHQ/CloakBrowser-Manager/issues) and attach the log so we can help. On Windows/macOS it's `logs/manager.log` in the data folder (`%LOCALAPPDATA%\CloakBrowser Manager` / `~/Library/Application Support/CloakBrowser Manager`); on Linux/Docker use `docker logs <container>`.

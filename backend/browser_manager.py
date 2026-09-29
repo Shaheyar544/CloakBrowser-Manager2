@@ -146,6 +146,36 @@ def _camoufox_process_env(display: int | None) -> dict[str, str]:
     return result
 
 
+def _camoufox_firefox_prefs(
+    profile: dict[str, Any], *, proxy_enabled: bool
+) -> dict[str, Any]:
+    """Build persistent Firefox preferences, including proxy DNS safeguards."""
+    prefs: dict[str, Any] = {
+        "browser.startup.page": 3 if profile.get("restore_session", True) else 1,
+        "browser.sessionstore.resume_from_crash": bool(
+            profile.get("restore_session", True)
+        ),
+    }
+    if proxy_enabled:
+        # Keep every lookup on the configured proxy path. Firefox DoH can
+        # otherwise select an unrelated regional resolver, and background
+        # prefetch/prediction must never resolve through the host network.
+        prefs.update(
+            {
+                "network.trr.mode": 5,
+                "network.proxy.socks_remote_dns": True,
+                "network.dns.disablePrefetch": True,
+                "network.dns.disablePrefetchFromHTTPS": True,
+                "network.prefetch-next": False,
+                "network.predictor.enabled": False,
+                "network.http.speculative-parallel-limit": 0,
+            }
+        )
+    if profile.get("allow_3p_cookies", True):
+        prefs["network.cookie.cookieBehavior"] = 0
+    return prefs
+
+
 async def test_proxy(raw_proxy: str) -> dict[str, Any]:
     """Connect through a proxy, return exit IP + geo + latency (or an error).
 
@@ -568,14 +598,9 @@ class BrowserManager:
         browser_data_dir = user_data_dir / CAMOUFOX_PROFILE_DIR
         browser_data_dir.mkdir(parents=True, exist_ok=True)
 
-        firefox_prefs: dict[str, Any] = {
-            "browser.startup.page": 3 if profile.get("restore_session", True) else 1,
-            "browser.sessionstore.resume_from_crash": bool(
-                profile.get("restore_session", True)
-            ),
-        }
-        if profile.get("allow_3p_cookies", True):
-            firefox_prefs["network.cookie.cookieBehavior"] = 0
+        firefox_prefs = _camoufox_firefox_prefs(
+            profile, proxy_enabled=normalized_proxy is not None
+        )
 
         options: dict[str, Any] = {
             "persistent_context": True,

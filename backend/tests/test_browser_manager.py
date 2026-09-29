@@ -11,6 +11,7 @@ import pytest
 
 from backend.browser_manager import (
     _camoufox_config_from_options,
+    _camoufox_firefox_prefs,
     _init_profile_defaults,
     _normalize_proxy,
     _playwright_proxy,
@@ -66,6 +67,28 @@ def test_camoufox_config_reassembles_numbered_environment_chunks():
     assert _camoufox_config_from_options(options) == {
         "navigator.hardwareConcurrency": 8
     }
+
+
+def test_camoufox_proxy_preferences_disable_browser_dns_bypasses():
+    prefs = _camoufox_firefox_prefs(
+        {"restore_session": True, "allow_3p_cookies": True},
+        proxy_enabled=True,
+    )
+
+    assert prefs["network.trr.mode"] == 5
+    assert prefs["network.proxy.socks_remote_dns"] is True
+    assert prefs["network.dns.disablePrefetch"] is True
+    assert prefs["network.dns.disablePrefetchFromHTTPS"] is True
+    assert prefs["network.prefetch-next"] is False
+    assert prefs["network.predictor.enabled"] is False
+    assert prefs["network.http.speculative-parallel-limit"] == 0
+
+
+def test_camoufox_direct_connection_does_not_force_dns_policy():
+    prefs = _camoufox_firefox_prefs({}, proxy_enabled=False)
+
+    assert "network.trr.mode" not in prefs
+    assert "network.proxy.socks_remote_dns" not in prefs
 
 
 def test_rejects_unknown_browser_engine():
