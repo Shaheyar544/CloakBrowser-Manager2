@@ -18,6 +18,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxcb1 libxext6 libxshmfence1 \
     libglib2.0-0 libgtk-3-0 libpangocairo-1.0-0 libcairo-gobject2 \
     libgdk-pixbuf-2.0-0 libxss1 libxtst6 fonts-liberation \
+    libdbus-glib-1-2 libxt6 libxcursor1 libxi6 libxrender1 \
+    fonts-noto-color-emoji \
     libgl1-mesa-dri libegl-mesa0 \
     procps wget ca-certificates xclip \
     && rm -rf /var/lib/apt/lists/*
@@ -44,6 +46,12 @@ WORKDIR /app
 # Python deps
 COPY backend/requirements.txt /app/backend/
 RUN pip install --no-cache-dir -r /app/backend/requirements.txt
+
+# Install the optional open-source browser engine used for unrestricted local
+# concurrency. Fetching it at image-build time keeps first launch predictable
+# and avoids workers racing to download the same browser bundle.
+RUN python -m camoufox set official/stable \
+    && python -m camoufox fetch
 
 # Backend code
 COPY backend/ /app/backend/

@@ -845,9 +845,14 @@ async def launch_profile(profile_id: str):
         status="running",
         runtime_mode=browser_mgr.runtime.runtime_mode,
         viewer_mode=browser_mgr.runtime.viewer_mode,
+        engine_name=browser_mgr.engine_name,
         vnc_ws_port=running.ws_port,
         display=f":{running.display}" if running.display is not None else None,
-        cdp_url=f"/api/profiles/{profile_id}/cdp",
+        cdp_url=(
+            f"/api/profiles/{profile_id}/cdp"
+            if running.cdp_port is not None
+            else None
+        ),
     )
 
 
@@ -884,7 +889,8 @@ async def health_check():
 def _windows_font_health() -> tuple[int | None, int | None, bool | None]:
     """Report Windows persona font coverage only where that persona is emulated."""
     if not (
-        browser_mgr.runtime.runtime_mode == "docker"
+        browser_mgr.engine_name == "cloakbrowser"
+        and browser_mgr.runtime.runtime_mode == "docker"
         and browser_mgr.runtime.host_os == "linux"
     ):
         return None, None, None
@@ -906,14 +912,22 @@ async def get_system_status():
     # in use). Fall back to the keyless constant before startup resolution runs.
     binary_version = browser_mgr.binary_version
     if not binary_version:
-        try:
-            from cloakbrowser.config import get_chromium_version
+        if browser_mgr.engine_name == "camoufox":
+            try:
+                from camoufox.pkgman import installed_verstr
 
-            binary_version = get_chromium_version()
-        except ImportError:
-            from cloakbrowser.config import CHROMIUM_VERSION
+                binary_version = installed_verstr()
+            except Exception:
+                binary_version = "not installed"
+        else:
+            try:
+                from cloakbrowser.config import get_chromium_version
 
-            binary_version = CHROMIUM_VERSION
+                binary_version = get_chromium_version()
+            except ImportError:
+                from cloakbrowser.config import CHROMIUM_VERSION
+
+                binary_version = CHROMIUM_VERSION
 
     profiles = db.list_profiles()
     fonts_present, fonts_required, fonts_complete = await asyncio.to_thread(
@@ -927,6 +941,7 @@ async def get_system_status():
         host_os=browser_mgr.runtime.host_os,
         runtime_mode=browser_mgr.runtime.runtime_mode,
         viewer_mode=browser_mgr.runtime.viewer_mode,
+        engine_name=browser_mgr.engine_name,
         windows_fonts_present=fonts_present,
         windows_fonts_required=fonts_required,
         windows_fonts_complete=fonts_complete,
@@ -1394,8 +1409,8 @@ async def vnc_proxy(websocket: WebSocket, profile_id: str):
 async def cdp_info(profile_id: str):
     """Return CDP connection info. Prevents SPA catch-all from serving index.html."""
     running = browser_mgr.running.get(profile_id)
-    if not running:
-        raise HTTPException(status_code=404, detail="Profile not running")
+    if not running or running.cdp_port is None:
+        raise HTTPException(status_code=404, detail="CDP is unavailable for this engine")
     return {
         "cdp_url": f"/api/profiles/{profile_id}/cdp",
         "usage": "playwright.chromium.connect_over_cdp('http://<host>/api/profiles/"
@@ -1422,8 +1437,8 @@ async def profile_screenshot(profile_id: str):
 async def cdp_json_version(profile_id: str, request: Request):
     """Proxy Chrome's /json/version, rewriting WS URLs to go through our proxy."""
     running = browser_mgr.running.get(profile_id)
-    if not running:
-        raise HTTPException(status_code=404, detail="Profile not running")
+    if not running or running.cdp_port is None:
+        raise HTTPException(status_code=404, detail="CDP is unavailable for this engine")
 
     try:
         async with httpx.AsyncClient() as client:
@@ -1449,8 +1464,8 @@ async def cdp_json_version(profile_id: str, request: Request):
 async def cdp_json_list(profile_id: str, request: Request):
     """Proxy Chrome's /json/list, rewriting WS URLs."""
     running = browser_mgr.running.get(profile_id)
-    if not running:
-        raise HTTPException(status_code=404, detail="Profile not running")
+    if not running or running.cdp_port is None:
+        raise HTTPException(status_code=404, detail="CDP is unavailable for this engine")
 
     try:
         async with httpx.AsyncClient() as client:
@@ -1540,8 +1555,8 @@ async def cdp_proxy(websocket: WebSocket, profile_id: str):
         return
 
     running = browser_mgr.running.get(profile_id)
-    if not running:
-        await websocket.close(code=4004, reason="Profile not running")
+    if not running or running.cdp_port is None:
+        await websocket.close(code=4004, reason="CDP unavailable for this engine")
         return
 
     await websocket.accept()
@@ -1568,8 +1583,8 @@ async def cdp_page_proxy(websocket: WebSocket, profile_id: str, path: str):
         return
 
     running = browser_mgr.running.get(profile_id)
-    if not running:
-        await websocket.close(code=4004, reason="Profile not running")
+    if not running or running.cdp_port is None:
+        await websocket.close(code=4004, reason="CDP unavailable for this engine")
         return
 
     await websocket.accept()

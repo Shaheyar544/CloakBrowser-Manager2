@@ -5,12 +5,14 @@ const TIER_LABEL: Record<string, string> = {
   pro: "Pro",
   free: "Free key",
   keyless: "Free (keyless)",
+  "open-source": "Camoufox",
 };
 
 const TIER_COLOR: Record<string, string> = {
   pro: "text-emerald-400",
   free: "text-sky-400",
   keyless: "text-amber-400",
+  "open-source": "text-emerald-400",
 };
 
 /** Small always-visible badge showing which binary/tier the Manager is running. */
@@ -19,7 +21,9 @@ export function SystemStatusBadge({ status }: { status: SystemStatus | null }) {
 
   const tier = status.license_tier || "keyless";
   const title =
-    tier === "keyless"
+    tier === "open-source"
+      ? `Open-source Camoufox engine — concurrent local sessions enabled — running ${status.binary_version}`
+      : tier === "keyless"
       ? "No license key set. Running the free keyless build. Open Settings to add a key for the latest Pro build."
       : `${TIER_LABEL[tier] ?? tier} license — running ${status.binary_version}`;
 

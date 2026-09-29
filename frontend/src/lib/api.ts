@@ -37,6 +37,7 @@ export interface Profile {
   status: "running" | "stopped" | "initializing";
   runtime_mode: RuntimeMode;
   viewer_mode: ViewerMode;
+  engine_name: "cloakbrowser" | "camoufox";
   vnc_ws_port: number | null;
   cdp_url: string | null;
   // Set when the last launch closed on a license denial (out of seats / bad
@@ -80,6 +81,7 @@ export interface LaunchResult {
   status: string;
   runtime_mode: RuntimeMode;
   viewer_mode: ViewerMode;
+  engine_name: "cloakbrowser" | "camoufox";
   vnc_ws_port: number | null;
   display: string | null;
   cdp_url: string | null;
@@ -98,11 +100,12 @@ export interface ProxyTestResult {
 export interface SystemStatus {
   running_count: number;
   binary_version: string;
-  license_tier: string; // "pro" | "free" | "keyless"
+  license_tier: string; // "pro" | "free" | "keyless" | "open-source"
   profiles_total: number;
   host_os: HostOS;
   runtime_mode: RuntimeMode;
   viewer_mode: ViewerMode;
+  engine_name: "cloakbrowser" | "camoufox";
   windows_fonts_present: number | null;
   windows_fonts_required: number | null;
   windows_fonts_complete: boolean | null;

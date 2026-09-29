@@ -12,6 +12,8 @@ import sys
 import venv
 from pathlib import Path
 
+from backend.env_file import load_env_file
+
 ROOT = Path(__file__).resolve().parent
 VENV_DIR = ROOT / ".venv"
 SETUP_MARKER = VENV_DIR / ".manager-setup.json"
@@ -65,6 +67,20 @@ def _ensure_environment() -> Path:
         ])
         state["requirements"] = requirements_hash
 
+    if os.environ.get("CLOAKBROWSER_MANAGER_ENGINE", "cloakbrowser").lower() == "camoufox":
+        installed = subprocess.run(
+            [
+                str(python),
+                "-c",
+                "from camoufox.pkgman import installed_verstr; installed_verstr()",
+            ],
+            cwd=ROOT,
+            capture_output=True,
+        )
+        if installed.returncode != 0:
+            _run([str(python), "-m", "camoufox", "set", "official/stable"])
+            _run([str(python), "-m", "camoufox", "fetch"])
+
     npm = shutil.which("npm.cmd" if os.name == "nt" else "npm")
     if not npm:
         raise RuntimeError("Node.js 18 or newer is required to build the Manager UI")
@@ -99,6 +115,7 @@ def _ensure_server_port_available() -> None:
 
 
 def main() -> int:
+    load_env_file()
     try:
         python = _ensure_environment()
     except (OSError, RuntimeError, subprocess.CalledProcessError) as exc:

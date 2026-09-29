@@ -44,13 +44,15 @@ export function NativeWindowStatus({
         <Monitor className="mx-auto mb-4 h-10 w-10 text-accent" />
         <h2 className="text-lg font-medium text-gray-100">Opened in a native window</h2>
         <p className="mt-2 text-sm text-gray-400">
-          {profileName} is running directly on this computer. Use its CloakBrowser window to browse.
+          {profileName} is running directly on this computer. Use its browser window to browse.
         </p>
-        <div className="mt-5 flex items-center justify-center gap-2 text-xs text-gray-500">
-          <ExternalLink className="h-3.5 w-3.5" />
-          <span>Automation remains available through Manager CDP</span>
-          <CdpEndpointButton cdpUrl={cdpUrl} />
-        </div>
+        {cdpUrl && (
+          <div className="mt-5 flex items-center justify-center gap-2 text-xs text-gray-500">
+            <ExternalLink className="h-3.5 w-3.5" />
+            <span>Automation remains available through Manager CDP</span>
+            <CdpEndpointButton cdpUrl={cdpUrl} />
+          </div>
+        )}
       </div>
     </div>
   );

@@ -57,6 +57,7 @@ const fakeProfile = {
   status: "stopped" as const,
   runtime_mode: "docker" as const,
   viewer_mode: "vnc" as const,
+  engine_name: "cloakbrowser" as const,
   vnc_ws_port: null,
   cdp_url: null,
 };

@@ -10,8 +10,10 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from backend.browser_manager import (
+    _camoufox_config_from_options,
     _init_profile_defaults,
     _normalize_proxy,
+    _playwright_proxy,
     _validate_proxy,
     BrowserManager,
     ProfileBusyError,
@@ -43,6 +45,32 @@ def test_normalize_already_http():
 
 def test_normalize_already_https():
     assert _normalize_proxy("https://host:443") == "https://host:443"
+
+
+def test_playwright_proxy_splits_encoded_credentials():
+    assert _playwright_proxy("http://user%40mail:p%3Ass@host:8080") == {
+        "server": "http://host:8080",
+        "username": "user@mail",
+        "password": "p:ss",
+    }
+
+
+def test_camoufox_config_reassembles_numbered_environment_chunks():
+    options = {
+        "env": {
+            "PATH": "ignored",
+            "CAMOU_CONFIG_1": 'Concurrency":8}',
+            "CAMOU_CONFIG_0": '{"navigator.hardware',
+        }
+    }
+    assert _camoufox_config_from_options(options) == {
+        "navigator.hardwareConcurrency": 8
+    }
+
+
+def test_rejects_unknown_browser_engine():
+    with pytest.raises(ValueError, match="Unsupported browser engine"):
+        BrowserManager(NATIVE_RUNTIME, engine_name="unknown")
 
 
 def test_normalize_already_socks5():
@@ -248,6 +276,95 @@ async def test_native_launch_skips_vnc_and_display(monkeypatch, tmp_path: Path):
     assert "--remote-debugging-address=127.0.0.1" in options["args"]
     assert options["headless"] is False
     assert options["extension_paths"] == []
+
+
+@pytest.mark.asyncio
+async def test_camoufox_launch_has_no_cdp_and_closes_owner_handle(
+    monkeypatch, tmp_path: Path
+):
+    context = MagicMock(pages=[])
+    context.close = AsyncMock()
+    handle = MagicMock()
+    handle.__aexit__ = AsyncMock()
+    manager = BrowserManager(NATIVE_RUNTIME, engine_name="camoufox")
+    manager._launch_camoufox = AsyncMock(return_value=(context, handle))
+
+    profile = _launch_profile(tmp_path)
+    profile["capture_preview"] = False
+    running = await manager.launch(profile)
+
+    assert running.engine_name == "camoufox"
+    assert running.cdp_port is None
+    assert manager.get_status(profile["id"])["cdp_url"] is None
+    assert manager._cdp_ports == set()
+
+    await manager.stop(profile["id"])
+
+    handle.__aexit__.assert_awaited_once_with(None, None, None)
+    context.close.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_camoufox_allows_three_distinct_profiles_concurrently(
+    monkeypatch, tmp_path: Path
+):
+    manager = BrowserManager(NATIVE_RUNTIME, engine_name="camoufox")
+    handles: list[MagicMock] = []
+
+    async def fake_launch(*_args):
+        await asyncio.sleep(0)
+        context = MagicMock(pages=[])
+        handle = MagicMock()
+        handle.__aexit__ = AsyncMock()
+        handles.append(handle)
+        return context, handle
+
+    manager._launch_camoufox = AsyncMock(side_effect=fake_launch)
+    profiles = []
+    for number in range(3):
+        profile = _launch_profile(tmp_path / str(number))
+        profile["id"] = f"profile-{number}"
+        profile["user_data_dir"] = str(tmp_path / str(number) / "profile")
+        profile["capture_preview"] = False
+        profiles.append(profile)
+
+    running = await asyncio.gather(*(manager.launch(profile) for profile in profiles))
+
+    assert len(running) == 3
+    assert set(manager.running) == {"profile-0", "profile-1", "profile-2"}
+    assert all(session.cdp_port is None for session in running)
+
+    await manager.cleanup_all()
+    assert manager.running == {}
+    assert all(handle.__aexit__.await_count == 1 for handle in handles)
+
+
+@pytest.mark.asyncio
+async def test_simultaneous_launch_of_same_profile_reports_busy(tmp_path: Path):
+    manager = BrowserManager(NATIVE_RUNTIME, engine_name="camoufox")
+    launch_entered = asyncio.Event()
+    finish_launch = asyncio.Event()
+    context = MagicMock(pages=[])
+    handle = MagicMock()
+    handle.__aexit__ = AsyncMock()
+
+    async def delayed_launch(*_args):
+        launch_entered.set()
+        await finish_launch.wait()
+        return context, handle
+
+    manager._launch_camoufox = AsyncMock(side_effect=delayed_launch)
+    profile = _launch_profile(tmp_path)
+    profile["capture_preview"] = False
+
+    first_launch = asyncio.create_task(manager.launch(profile))
+    await launch_entered.wait()
+    with pytest.raises(ProfileBusyError, match="already running"):
+        await manager.launch(profile)
+
+    finish_launch.set()
+    await first_launch
+    await manager.stop(profile["id"])
 
 
 @pytest.mark.asyncio

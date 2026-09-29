@@ -130,6 +130,7 @@ class ProfileResponse(BaseModel):
     status: str = "stopped"
     runtime_mode: RuntimeMode = "docker"
     viewer_mode: ViewerMode = "vnc"
+    engine_name: str = "cloakbrowser"
     vnc_ws_port: int | None = None
     cdp_url: str | None = None
     # Set when the profile's last launch closed on a license denial (out of
@@ -142,6 +143,7 @@ class LaunchResponse(BaseModel):
     status: str = "running"
     runtime_mode: RuntimeMode
     viewer_mode: ViewerMode
+    engine_name: str = "cloakbrowser"
     vnc_ws_port: int | None = None
     display: str | None = None
     cdp_url: str | None = None
@@ -155,6 +157,7 @@ class StatusResponse(BaseModel):
     host_os: HostOS
     runtime_mode: RuntimeMode
     viewer_mode: ViewerMode
+    engine_name: str = "cloakbrowser"
     windows_fonts_present: int | None = None
     windows_fonts_required: int | None = None
     windows_fonts_complete: bool | None = None
@@ -183,6 +186,7 @@ class ProfileStatusResponse(BaseModel):
     status: str
     runtime_mode: RuntimeMode
     viewer_mode: ViewerMode
+    engine_name: str = "cloakbrowser"
     vnc_ws_port: int | None = None
     display: str | None = None
     cdp_url: str | None = None

@@ -13,7 +13,7 @@ The identities don't just look different. They hold up.
 
 <p align="center">
 Self-hosted alternative to Multilogin, GoLogin, and AdsPower.<br>
-Start free with one concurrent browser, scale to more on a paid plan.
+Use open-source Camoufox for local concurrency, or CloakBrowser with licensed seats.
 </p>
 
 <p align="center">
@@ -66,6 +66,24 @@ git clone https://github.com/CloakHQ/CloakBrowser-Manager.git
 cd CloakBrowser-Manager
 docker compose up --build
 ```
+
+The source-built Compose deployment defaults to the open-source **Camoufox**
+engine, which can run multiple local sessions without CloakBrowser seat limits.
+Set the engine explicitly in `.env` when needed:
+
+```dotenv
+# Open-source Firefox engine: multiple concurrent local profiles
+CLOAKBROWSER_MANAGER_ENGINE=camoufox
+
+# Or retain the licensed Chromium engine and its configured seat limit
+# CLOAKBROWSER_MANAGER_ENGINE=cloakbrowser
+```
+
+Camoufox profiles keep their own cookies and browser state under each Manager
+profile directory, and the Manager still refuses a second launch of the same
+profile. Camoufox is Firefox-based, so Chromium CDP automation and unpacked
+Chrome extensions are unavailable in this mode. Switching engines does not
+convert or delete the other engine's browser state.
 
 Open [http://localhost:8080](http://localhost:8080), create a profile, and click Launch.
 
@@ -173,8 +191,9 @@ docker compose up --build
 
 - Windows or macOS native: Python 3.10+, Node.js 18+
 - Linux server: Docker 20.10+
-- ~2 GB disk (application + browser binary)
-- ~512 MB RAM per running profile
+- ~4 GB disk for a Docker image containing both engines, plus profile data
+- ~1–2 GB RAM per active profile in normal interactive use
+- For 2–3 concurrent sessions: 4–8 CPU cores and 8–16 GB RAM recommended
 
 ## Updating
 
@@ -206,7 +225,13 @@ Profiles and session data remain in the native application-data directory or the
 
 ## Automation API
 
-Every running profile exposes a CDP (Chrome DevTools Protocol) endpoint. Connect Playwright or Puppeteer to automate a profile while watching it live in the browser.
+Profiles running with the CloakBrowser engine expose a CDP (Chrome DevTools
+Protocol) endpoint. Connect Playwright or Puppeteer to automate one while
+watching the same session live in the browser.
+
+> CDP is available only with `CLOAKBROWSER_MANAGER_ENGINE=cloakbrowser`.
+> Camoufox profiles remain controllable by the Manager and visible through VNC,
+> but do not expose Chromium CDP.
 
 ```python
 from playwright.async_api import async_playwright
@@ -229,7 +254,22 @@ const page = browser.contexts()[0].pages()[0];
 await page.goto("https://example.com");
 ```
 
-The CDP URL is available from the running-profile view. The same browser session is accessible through its native window on Windows/macOS or through VNC on Linux Docker, and programmatically through the API on every platform.
+For CloakBrowser profiles, the CDP URL is available from the running-profile
+view. Every profile remains accessible through its native window on
+Windows/macOS or through VNC on Linux Docker.
+
+## Camoufox concurrency smoke test
+
+After installing the backend requirements and running `python -m camoufox fetch`,
+verify the engine locally with three real, temporary profiles:
+
+```bash
+python scripts/smoke_camoufox_concurrency.py --sessions 3
+```
+
+The smoke test opens native browser windows briefly, confirms that each profile
+has its own cookie store and data directory, and confirms that a second launch
+of an already-running profile is rejected.
 
 ## Remote Access
 

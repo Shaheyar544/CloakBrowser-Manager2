@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from importlib.metadata import PackageNotFoundError, version as package_version
 import json
 import logging
 import os
@@ -13,6 +14,7 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 from cloakbrowser import launch_persistent_context_async
 from cloakbrowser.license import (
@@ -91,6 +93,57 @@ def _validate_proxy(url: str) -> None:
         raise ValueError(f"Proxy URL missing hostname: {url}")
     if not parsed.port:
         raise ValueError(f"Proxy URL missing port: {url}")
+
+
+def _playwright_proxy(url: str | None) -> dict[str, str] | None:
+    """Convert a normalized proxy URL to Playwright's structured form."""
+    if not url:
+        return None
+    parsed = urlparse(url)
+    result = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"}
+    if parsed.username:
+        result["username"] = unquote(parsed.username)
+    if parsed.password:
+        result["password"] = unquote(parsed.password)
+    return result
+
+
+def _camoufox_config_from_options(options: dict[str, Any]) -> dict[str, Any]:
+    """Extract Camoufox's generated identity from Playwright launch options.
+
+    Camoufox transports its resolved fingerprint as numbered CAMOU_CONFIG_*
+    environment chunks. Persist only that JSON identity, never the inherited
+    process environment or executable path, so secrets and host-specific paths
+    cannot enter a browser profile.
+    """
+    env = options.get("env") or {}
+    chunks = sorted(
+        (
+            (int(key.rsplit("_", 1)[1]), value)
+            for key, value in env.items()
+            if key.startswith("CAMOU_CONFIG_")
+        ),
+        key=lambda item: item[0],
+    )
+    if not chunks:
+        raise RuntimeError("Camoufox did not generate a fingerprint configuration")
+    config = json.loads("".join(str(value) for _, value in chunks))
+    if not isinstance(config, dict):
+        raise RuntimeError("Camoufox fingerprint configuration is not an object")
+    return config
+
+
+def _camoufox_process_env(display: int | None) -> dict[str, str]:
+    """Pass only OS variables the browser needs, plus its assigned display."""
+    allowed = {
+        "APPDATA", "DBUS_SESSION_BUS_ADDRESS", "HOME", "LANG", "LC_ALL",
+        "LOCALAPPDATA", "PATH", "SYSTEMROOT", "TEMP", "TMP", "USERPROFILE",
+        "WINDIR", "XAUTHORITY", "XDG_RUNTIME_DIR",
+    }
+    result = {key: value for key, value in os.environ.items() if key in allowed}
+    if display is not None:
+        result["DISPLAY"] = f":{display}"
+    return result
 
 
 async def test_proxy(raw_proxy: str) -> dict[str, Any]:
@@ -215,6 +268,9 @@ def _init_profile_defaults(user_data_dir: Path) -> None:
 
 CDP_START_ATTEMPTS = 3
 CDP_READY_TIMEOUT = 10.0
+SUPPORTED_ENGINES = frozenset({"cloakbrowser", "camoufox"})
+CAMOUFOX_PROFILE_DIR = "camoufox"
+CAMOUFOX_FINGERPRINT_FILE = ".camoufox-fingerprint.json"
 
 # Periodic browser preview capture (shown in the edit view of a stopped profile).
 # Captured every interval while running + once on stop; written to the profile's
@@ -310,12 +366,17 @@ class ProfileBusyError(RuntimeError):
 class RunningProfile:
     profile_id: str
     context: Any  # Playwright BrowserContext
-    cdp_port: int
+    cdp_port: int | None
     display: int | None = None
     ws_port: int | None = None
     user_data_dir: Path | None = None
     screenshot_task: Any = None  # asyncio.Task for the periodic screenshot loop
     capture_preview: bool = True
+    engine_name: str = "cloakbrowser"
+    # AsyncCamoufox is an async context manager that also owns the Playwright
+    # driver process. Keep it alive for the full browser session and exit it on
+    # stop; closing only the BrowserContext would otherwise leak the driver.
+    engine_handle: Any = None
     # Path to the wrapper's per-launch denial file (set by launch_persistent_
     # context_async on the returned context). Read on close to tell a seat/
     # license denial apart from a real crash or a user-initiated close.
@@ -328,8 +389,20 @@ class BrowserManager:
         runtime_config: RuntimeConfig | None = None,
         license_key: str | None = None,
         release_channel: str | None = None,
+        engine_name: str | None = None,
     ):
         self.runtime = runtime_config or resolve_runtime()
+        selected_engine = (
+            engine_name
+            or os.environ.get("CLOAKBROWSER_MANAGER_ENGINE")
+            or "cloakbrowser"
+        ).strip().lower()
+        if selected_engine not in SUPPORTED_ENGINES:
+            supported = ", ".join(sorted(SUPPORTED_ENGINES))
+            raise ValueError(
+                f"Unsupported browser engine {selected_engine!r}; choose one of: {supported}"
+            )
+        self.engine_name = selected_engine
         # App-wide license: passed to every launch so the wrapper downloads the
         # Pro build and injects the key the Pro binary needs to boot + take a seat.
         self.license_key = license_key
@@ -366,6 +439,30 @@ class BrowserManager:
         Pro download stays out of the launch path and auto-launch's 60s timeout.
         Never raises: on any failure the keyless baked-in binary remains usable.
         """
+        if self.engine_name == "camoufox":
+            self.license_tier = "open-source"
+            self.license_plan = "unlimited"
+            try:
+                from camoufox.pkgman import installed_verstr
+
+                self.binary_version = installed_verstr()
+            except PackageNotFoundError:
+                self.binary_version = "not installed"
+                logger.error(
+                    "Camoufox package is not installed; run pip install -r "
+                    "backend/requirements.txt"
+                )
+            except Exception as exc:
+                try:
+                    self.binary_version = f"package {package_version('camoufox')}"
+                except PackageNotFoundError:
+                    self.binary_version = "not installed"
+                logger.error(
+                    "Camoufox browser is not installed; run python -m camoufox fetch: %s",
+                    exc,
+                )
+            return
+
         from cloakbrowser.config import CHROMIUM_VERSION, get_chromium_version
         from cloakbrowser.download import ensure_binary
         from cloakbrowser.license import (
@@ -413,6 +510,203 @@ class BrowserManager:
                 exc_info=True,
             )
 
+    async def _camoufox_fingerprint(
+        self, profile: dict[str, Any], user_data_dir: Path, display: int | None
+    ) -> dict[str, Any]:
+        """Load or mint one stable Camoufox identity for this profile."""
+        config_path = user_data_dir / CAMOUFOX_FINGERPRINT_FILE
+        if config_path.exists():
+            try:
+                saved = json.loads(config_path.read_text(encoding="utf-8"))
+                if isinstance(saved, dict):
+                    return saved
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    f"Invalid saved Camoufox fingerprint for profile {profile['id']}"
+                ) from exc
+
+        from browserforge.fingerprints import Screen
+        from camoufox.utils import launch_options as camoufox_launch_options
+
+        target_os = "macos" if self.runtime.host_os == "macos" else "windows"
+        width = int(profile.get("screen_width") or 1920)
+        height = int(profile.get("screen_height") or 1080)
+        generated = await asyncio.to_thread(
+            camoufox_launch_options,
+            os=target_os,
+            screen=Screen(max_width=width, max_height=height),
+            headless=False,
+            env=_camoufox_process_env(display),
+        )
+        config = _camoufox_config_from_options(generated)
+        user_data_dir.mkdir(parents=True, exist_ok=True)
+        temporary = config_path.with_suffix(config_path.suffix + ".tmp")
+        temporary.write_text(
+            json.dumps(config, indent=2, sort_keys=True), encoding="utf-8"
+        )
+        os.replace(temporary, config_path)
+        return config
+
+    async def _launch_camoufox(
+        self, profile: dict[str, Any], user_data_dir: Path, display: int | None
+    ) -> tuple[Any, Any]:
+        """Launch an uncapped persistent Camoufox context and its owner handle."""
+        try:
+            from camoufox.async_api import AsyncCamoufox
+        except ImportError as exc:
+            raise RuntimeError(
+                "Camoufox is not installed; install backend requirements and run "
+                "python -m camoufox fetch"
+            ) from exc
+
+        raw_proxy = profile.get("proxy") or None
+        normalized_proxy = _normalize_proxy(raw_proxy) if raw_proxy else None
+        if normalized_proxy:
+            _validate_proxy(normalized_proxy)
+
+        config = await self._camoufox_fingerprint(profile, user_data_dir, display)
+        browser_data_dir = user_data_dir / CAMOUFOX_PROFILE_DIR
+        browser_data_dir.mkdir(parents=True, exist_ok=True)
+
+        firefox_prefs: dict[str, Any] = {
+            "browser.startup.page": 3 if profile.get("restore_session", True) else 1,
+            "browser.sessionstore.resume_from_crash": bool(
+                profile.get("restore_session", True)
+            ),
+        }
+        if profile.get("allow_3p_cookies", True):
+            firefox_prefs["network.cookie.cookieBehavior"] = 0
+
+        options: dict[str, Any] = {
+            "persistent_context": True,
+            "user_data_dir": str(browser_data_dir),
+            "headless": False,
+            "config": config,
+            # Reusing the generated navigator/screen values is intentional: a
+            # profile must present the same identity on every later launch.
+            "i_know_what_im_doing": True,
+            "proxy": _playwright_proxy(normalized_proxy),
+            "geoip": bool(normalized_proxy and profile.get("geoip", False)),
+            "enable_cache": True,
+            "firefox_user_prefs": firefox_prefs,
+            "args": list(profile.get("launch_args") or []),
+            "addons": list(profile.get("extension_paths") or []),
+            "env": _camoufox_process_env(display),
+        }
+        locale = profile.get("locale")
+        if locale:
+            options["locale"] = locale
+        if profile.get("humanize", False):
+            options["humanize"] = (
+                1.5 if profile.get("human_preset") == "careful" else 1.0
+            )
+
+        launcher = AsyncCamoufox(**options)
+        context = await launcher.__aenter__()
+        return context, launcher
+
+    async def _launch_cloakbrowser(
+        self, profile: dict[str, Any], display: int | None
+    ) -> tuple[Any, int]:
+        """Launch the existing licensed Chromium engine and verify its CDP."""
+        profile_id = profile["id"]
+        user_launch_args = profile.get("launch_args") or []
+        conflicting_debug_args = [
+            arg
+            for arg in user_launch_args
+            if arg.startswith(
+                ("--remote-debugging-port", "--remote-debugging-address")
+            )
+        ]
+        if conflicting_debug_args:
+            raise ValueError(
+                "Manager owns remote debugging configuration; remove: "
+                + ", ".join(conflicting_debug_args)
+            )
+
+        extra_args = self._build_fingerprint_args(profile)
+        extra_args += user_launch_args
+        extra_args.append("--remote-debugging-address=127.0.0.1")
+        if profile.get("restore_session", True):
+            extra_args.append("--restore-last-session")
+
+        raw_proxy = profile.get("proxy") or None
+        proxy = _normalize_proxy(raw_proxy) if raw_proxy else None
+        if proxy:
+            _validate_proxy(proxy)
+
+        launch_options: dict[str, Any] = {
+            "user_data_dir": profile["user_data_dir"],
+            "headless": False,
+            "proxy": proxy,
+            "args": extra_args,
+            "timezone": profile.get("timezone") or None,
+            "locale": profile.get("locale") or None,
+            "humanize": bool(profile.get("humanize", False)),
+            "human_preset": profile.get("human_preset", "default"),
+            "geoip": bool(profile.get("geoip", False)),
+            "color_scheme": profile.get("color_scheme") or None,
+            "extension_paths": profile.get("extension_paths") or [],
+            "license_key": self.license_key,
+            "release_channel": self.release_channel,
+        }
+        if display is not None:
+            launch_options["viewport"] = {
+                "width": profile.get("screen_width", 1920),
+                "height": profile.get("screen_height", 1080) - 133,
+            }
+            launch_options["env"] = {**os.environ, "DISPLAY": f":{display}"}
+
+        context: Any | None = None
+        cdp_port: int | None = None
+        last_cdp_error: Exception | None = None
+        for attempt in range(1, CDP_START_ATTEMPTS + 1):
+            cdp_port = self._reserve_cdp_port()
+            launch_options["args"] = [
+                *extra_args,
+                f"--remote-debugging-port={cdp_port}",
+            ]
+            try:
+                context = await launch_persistent_context_async(**launch_options)
+                denial_path = getattr(context, "_cloak_denial_path", None)
+                lic = self._denial_error(denial_path)
+                if lic is not None:
+                    raise lic
+                await self._wait_for_cdp(cdp_port, denial_path=denial_path)
+                return context, cdp_port
+            except asyncio.CancelledError:
+                if context is not None:
+                    await self._close_context(context, profile_id)
+                self._release_cdp_port(cdp_port)
+                raise
+            except Exception as exc:
+                last_cdp_error = exc
+                denial_path = (
+                    getattr(context, "_cloak_denial_path", None)
+                    if context is not None
+                    else None
+                )
+                if context is not None:
+                    await self._close_context(context, profile_id)
+                self._release_cdp_port(cdp_port)
+                context = None
+                cdp_port = None
+                if isinstance(exc, CloakBrowserLicenseError):
+                    raise
+                lic = self._denial_error(denial_path)
+                if lic is not None:
+                    raise lic from exc
+                logger.warning(
+                    "Browser/CDP startup attempt %d/%d failed for %s: %s",
+                    attempt,
+                    CDP_START_ATTEMPTS,
+                    profile_id,
+                    exc,
+                )
+        raise RuntimeError(
+            f"Unable to start verified CDP for profile {profile_id}"
+        ) from last_cdp_error
+
     async def launch(self, profile: dict[str, Any]) -> RunningProfile:
         """Launch a browser instance using the configured host runtime."""
         profile_id = profile["id"]
@@ -422,8 +716,9 @@ class BrowserManager:
         from . import diagnostics
 
         logger.info(
-            "Launching profile %s: seed=%s proxy=%s tier=%s plan=%s runtime=%s",
+            "Launching profile %s: engine=%s seed=%s proxy=%s tier=%s plan=%s runtime=%s",
             profile_id,
+            self.engine_name,
             profile.get("fingerprint_seed"),
             diagnostics.redact_proxy(profile.get("proxy")),
             self.license_tier,
@@ -442,7 +737,7 @@ class BrowserManager:
                 # in Docker mode the launch would even delete its Singleton lock.
                 raise ProfileBusyError(f"Profile {profile_id} is still closing; retry shortly")
             if profile_id in self.running or profile_id in self._launching:
-                raise RuntimeError(f"Profile {profile_id} is already running")
+                raise ProfileBusyError(f"Profile {profile_id} is already running")
             self._launching.add(profile_id)
             # Fresh attempt — drop any stale denial from a previous launch so the
             # status poll doesn't keep showing an old "out of seats" message.
@@ -452,25 +747,34 @@ class BrowserManager:
         ws_port: int | None = None
         cdp_port: int | None = None
         context: Any | None = None
+        engine_handle: Any | None = None
         try:
             if self.runtime.viewer_mode == "vnc":
                 display, ws_port = await self.vnc.allocate()
 
             user_data_dir = Path(profile["user_data_dir"])
+            user_data_dir.mkdir(parents=True, exist_ok=True)
 
             # Docker can leave stale locks after an unclean container exit. Native
             # mode must let Chromium arbitrate profile ownership itself.
-            if self.runtime.runtime_mode == "docker":
+            if (
+                self.engine_name == "cloakbrowser"
+                and self.runtime.runtime_mode == "docker"
+            ):
                 for lock_file in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
                     (user_data_dir / lock_file).unlink(missing_ok=True)
 
-            _init_profile_defaults(user_data_dir)
+            if self.engine_name == "cloakbrowser":
+                _init_profile_defaults(user_data_dir)
 
             # One-time per profile (opt-out via set_google_default): make Google
             # the default search engine. Runs before the user-facing launch;
             # reports "initializing" via get_status while it works (one short
             # headless launch). Never fatal.
-            if profile.get("set_google_default", True):
+            if (
+                self.engine_name == "cloakbrowser"
+                and profile.get("set_google_default", True)
+            ):
                 await self._ensure_search_engine(profile_id, user_data_dir)
 
             if display is not None and ws_port is not None:
@@ -481,113 +785,17 @@ class BrowserManager:
                     height=profile.get("screen_height", 1080),
                 )
 
-            user_launch_args = profile.get("launch_args") or []
-            conflicting_debug_args = [
-                arg for arg in user_launch_args
-                if arg.startswith(("--remote-debugging-port", "--remote-debugging-address"))
-            ]
-            if conflicting_debug_args:
-                raise ValueError(
-                    "Manager owns remote debugging configuration; remove: "
-                    + ", ".join(conflicting_debug_args)
+            if self.engine_name == "camoufox":
+                context, engine_handle = await self._launch_camoufox(
+                    profile, user_data_dir, display
                 )
-
-            extra_args = self._build_fingerprint_args(profile)
-            extra_args += user_launch_args
-            extra_args.append("--remote-debugging-address=127.0.0.1")
-            # Reopen the tabs the user had open when the profile was last stopped.
-            # Chrome's persistent session is saved on disk but only restored when told to.
-            if profile.get("restore_session", True):
-                extra_args.append("--restore-last-session")
-
-            raw_proxy = profile.get("proxy") or None
-            proxy = _normalize_proxy(raw_proxy) if raw_proxy else None
-            if proxy:
-                _validate_proxy(proxy)
-
-            launch_options: dict[str, Any] = {
-                "user_data_dir": profile["user_data_dir"],
-                "headless": False,
-                "proxy": proxy,
-                "args": extra_args,
-                "timezone": profile.get("timezone") or None,
-                "locale": profile.get("locale") or None,
-                "humanize": bool(profile.get("humanize", False)),
-                "human_preset": profile.get("human_preset", "default"),
-                "geoip": bool(profile.get("geoip", False)),
-                "color_scheme": profile.get("color_scheme") or None,
-                "extension_paths": profile.get("extension_paths") or [],
-                "license_key": self.license_key,
-                "release_channel": self.release_channel,
-            }
-            if display is not None:
-                launch_options["viewport"] = {
-                    "width": profile.get("screen_width", 1920),
-                    "height": profile.get("screen_height", 1080) - 133,
-                }
-                launch_options["env"] = {**os.environ, "DISPLAY": f":{display}"}
-
-            last_cdp_error: Exception | None = None
-            for attempt in range(1, CDP_START_ATTEMPTS + 1):
-                cdp_port = self._reserve_cdp_port()
-                launch_options["args"] = [
-                    *extra_args,
-                    f"--remote-debugging-port={cdp_port}",
-                ]
-                try:
-                    context = await launch_persistent_context_async(**launch_options)
-                    # An over-cap/denied seat leaves the browser booting but never
-                    # serving a usable CDP endpoint — so waiting on CDP would just
-                    # time out (or worse). The wrapper wrote the reason to a denial
-                    # file; check it immediately and each CDP poll so a denial bails
-                    # in ~1s instead of waiting out CDP that will never come.
-                    denial_path = getattr(context, "_cloak_denial_path", None)
-                    lic = self._denial_error(denial_path)
-                    if lic is not None:
-                        raise lic
-                    await self._wait_for_cdp(cdp_port, denial_path=denial_path)
-                    break
-                except asyncio.CancelledError:
-                    if context is not None:
-                        await self._close_context(context, profile_id)
-                    self._release_cdp_port(cdp_port)
-                    context = None
-                    cdp_port = None
-                    raise
-                except Exception as exc:
-                    last_cdp_error = exc
-                    # Grab the denial path before dropping the context: a denial
-                    # that lands during _wait_for_cdp surfaces as a TimeoutError,
-                    # not the license exception, so check the file explicitly.
-                    dp = getattr(context, "_cloak_denial_path", None) if context is not None else None
-                    if context is not None:
-                        await self._close_context(context, profile_id)
-                    self._release_cdp_port(cdp_port)
-                    context = None
-                    cdp_port = None
-                    # A license denial (out of seats, bad/expired key, server
-                    # unreachable, local config) is deterministic — retrying just
-                    # wastes ~10s and re-denies. Fail fast with the real reason,
-                    # whether it raised as the license exception or as a timeout.
-                    if isinstance(exc, CloakBrowserLicenseError):
-                        raise
-                    lic = self._denial_error(dp)
-                    if lic is not None:
-                        raise lic from exc
-                    logger.warning(
-                        "Browser/CDP startup attempt %d/%d failed for %s: %s",
-                        attempt,
-                        CDP_START_ATTEMPTS,
-                        profile_id,
-                        exc,
-                    )
             else:
-                raise RuntimeError(
-                    f"Unable to start verified CDP for profile {profile_id}"
-                ) from last_cdp_error
+                context, cdp_port = await self._launch_cloakbrowser(profile, display)
 
-            if context is None or cdp_port is None:
-                raise RuntimeError(f"Browser startup did not complete for profile {profile_id}")
+            if context is None:
+                raise RuntimeError(
+                    f"Browser startup did not complete for profile {profile_id}"
+                )
 
             if self.runtime.viewer_mode == "vnc":
                 # Capture copied text so the Manager clipboard endpoint can read it.
@@ -619,7 +827,13 @@ class BrowserManager:
                 ws_port=ws_port,
                 user_data_dir=user_data_dir,
                 capture_preview=bool(profile.get("capture_preview", True)),
-                denial_path=getattr(context, "_cloak_denial_path", None),
+                engine_name=self.engine_name,
+                engine_handle=engine_handle,
+                denial_path=(
+                    getattr(context, "_cloak_denial_path", None)
+                    if self.engine_name == "cloakbrowser"
+                    else None
+                ),
             )
             context.on(
                 "close",
@@ -640,8 +854,9 @@ class BrowserManager:
                 )
 
             logger.info(
-                "Launched profile %s (runtime=%s, display=%s, ws_port=%s, cdp_port=%d)",
+                "Launched profile %s (engine=%s, runtime=%s, display=%s, ws_port=%s, cdp_port=%s)",
                 profile_id,
+                self.engine_name,
                 self.runtime.runtime_mode,
                 f":{display}" if display is not None else "native",
                 ws_port,
@@ -658,7 +873,12 @@ class BrowserManager:
                 self._reserve_stopping(profile_id)
             try:
                 if context is not None:
-                    await self._close_context(context, profile_id)
+                    if engine_handle is not None:
+                        await self._close_context(
+                            context, profile_id, engine_handle=engine_handle
+                        )
+                    else:
+                        await self._close_context(context, profile_id)
                 if cdp_port is not None:
                     self._release_cdp_port(cdp_port)
                 if display is not None:
@@ -826,9 +1046,18 @@ class BrowserManager:
         except asyncio.CancelledError:
             pass
 
-    async def _close_context(self, context: Any, profile_id: str) -> None:
+    async def _close_context(
+        self,
+        context: Any,
+        profile_id: str,
+        *,
+        engine_handle: Any | None = None,
+    ) -> None:
         try:
-            await context.close()
+            if engine_handle is not None:
+                await engine_handle.__aexit__(None, None, None)
+            else:
+                await context.close()
         except Exception as exc:
             logger.warning("Error closing context for %s: %s", profile_id, exc)
 
@@ -841,7 +1070,14 @@ class BrowserManager:
         if running.screenshot_task is not None:
             running.screenshot_task.cancel()
         if close_context:
-            await self._close_context(running.context, running.profile_id)
+            if running.engine_handle is not None:
+                await self._close_context(
+                    running.context,
+                    running.profile_id,
+                    engine_handle=running.engine_handle,
+                )
+            else:
+                await self._close_context(running.context, running.profile_id)
         if running.display is not None:
             await self.vnc.stop_vnc(running.display)
         self._release_cdp_port(running.cdp_port)
@@ -986,13 +1222,22 @@ class BrowserManager:
             "status": state,
             "runtime_mode": self.runtime.runtime_mode,
             "viewer_mode": self.runtime.viewer_mode,
+            "engine_name": (
+                running.engine_name
+                if running and isinstance(running.engine_name, str)
+                else self.engine_name
+            ),
             "vnc_ws_port": running.ws_port if running else None,
             "display": (
                 f":{running.display}"
                 if running and running.display is not None
                 else None
             ),
-            "cdp_url": f"/api/profiles/{profile_id}/cdp" if running else None,
+            "cdp_url": (
+                f"/api/profiles/{profile_id}/cdp"
+                if running and running.cdp_port is not None
+                else None
+            ),
             # Set when the last launch closed on a license denial (post-handshake
             # out-of-seats / bad key). Only meaningful while stopped; cleared on
             # the next launch. {message, reason, upgrade_url?} or None.
@@ -1049,8 +1294,9 @@ class BrowserManager:
                 return port
         raise RuntimeError("Unable to reserve a unique CDP port")
 
-    def _release_cdp_port(self, port: int) -> None:
-        self._cdp_ports.discard(port)
+    def _release_cdp_port(self, port: int | None) -> None:
+        if port is not None:
+            self._cdp_ports.discard(port)
 
     @staticmethod
     async def _fetch_cdp_version(port: int) -> dict[str, Any]:
